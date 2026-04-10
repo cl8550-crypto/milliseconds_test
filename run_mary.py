@@ -41,7 +41,7 @@ from utils import (
     get_best_prices,
 )
 from risk_manager import RiskManager
-from illiquid_market_maker import IlliquidMarketMaker
+from illiquid_market_maker_mary import IlliquidMarketMaker
 
 
 # ------------------------------------------------------------------ #
