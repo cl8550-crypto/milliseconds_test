@@ -1,6 +1,6 @@
 import shift
-from datetime import datetime
-from utils import get_buying_power, get_position, log
+from time import time
+from utils import log, get_position
 
 
 class RiskManager:
@@ -8,12 +8,12 @@ class RiskManager:
         self,
         trader: shift.Trader,
         total_tickers: list[str],
-        max_bp_usage: float = 0.60,
-        max_position_lots: int = 3,
-        max_loss_per_ticker: float = -2000.0,
-        max_total_loss: float = -20000.0,
-        max_concurrent_positions: int = 12,    # raised from 6 — BP is real throttle
-        max_bp_per_trade: float = 100000.0,    # raised from 50k — allows GS/CAT
+        max_bp_usage: float          = 0.60,
+        max_position_lots: int       = 2,
+        max_loss_per_ticker: float   = -2000.0,
+        max_total_loss: float        = -20000.0,
+        max_concurrent_positions: int = 12,
+        max_bp_per_trade: float      = 65000.0,
     ):
         self.trader                   = trader
         self.total_tickers            = total_tickers
@@ -24,263 +24,237 @@ class RiskManager:
         self.max_concurrent_positions = max_concurrent_positions
         self.max_bp_per_trade         = max_bp_per_trade
 
-        self.initial_bp          = None
-        self.halted_tickers      = set()
-        self.all_halted          = False
-        self.ticker_strategy_map = {}
+        self.starting_bp   = 0.0
+        self.halted_tickers: set[str] = set()
+        self.all_halted    = False
 
     # ------------------------------------------------------------------ #
-    #  Initialization                                                      #
+    #  Initialise                                                          #
     # ------------------------------------------------------------------ #
     def initialize(self):
-        self.initial_bp = get_buying_power(self.trader)
-        log("RISK", "INIT", f"Starting BP:               ${self.initial_bp:,.2f}")
-        log("RISK", "INIT", f"Max BP usage:              {self.max_bp_usage*100:.0f}%")
-        log("RISK", "INIT", f"Max position per ticker:   {self.max_position_lots} lots")
-        log("RISK", "INIT", f"Max loss per ticker:       ${self.max_loss_per_ticker:,.2f}")
-        log("RISK", "INIT", f"Max total loss:            ${self.max_total_loss:,.2f}")
-        log("RISK", "INIT", f"Max concurrent positions:  {self.max_concurrent_positions}")
-        log("RISK", "INIT", f"Max BP per trade:          ${self.max_bp_per_trade:,.2f}")
+        self.starting_bp = self.trader.get_portfolio_summary().get_total_bp()
+        log("RISK", "INIT",
+            f"Starting BP:               ${self.starting_bp:,.2f}")
+        log("RISK", "INIT",
+            f"Max BP usage:              {int(self.max_bp_usage*100)}%")
+        log("RISK", "INIT",
+            f"Max position per ticker:   {self.max_position_lots} lots")
+        log("RISK", "INIT",
+            f"Max loss per ticker:       ${self.max_loss_per_ticker:,.2f}")
+        log("RISK", "INIT",
+            f"Max total loss:            ${self.max_total_loss:,.2f}")
+        log("RISK", "INIT",
+            f"Max concurrent positions:  {self.max_concurrent_positions}")
+        log("RISK", "INIT",
+            f"Max BP per trade:          ${self.max_bp_per_trade:,.2f}")
 
     # ------------------------------------------------------------------ #
-    #  Dynamic lot sizing                                                  #
+    #  Lot sizing                                                          #
     # ------------------------------------------------------------------ #
-    def get_safe_lot_size(self, price: float, max_lots: int = 3) -> int:
-        """
-        Calculate affordable lot size based on:
-        1. Available buying power
-        2. Per-trade BP cap ($100k — allows GS $92k, CAT $63k)
-        3. Requested max lots
-        """
-        if price <= 0 or self.initial_bp is None:
-            return 0
-
-        current_bp   = get_buying_power(self.trader)
-        bp_floor     = self.initial_bp * (1 - self.max_bp_usage)
-        available_bp = max(0, current_bp - bp_floor)
-
-        # Cap by available BP
-        max_from_bp  = int(available_bp / (price * 100))
-
-        # Cap by per-trade limit
-        max_from_cap = int(self.max_bp_per_trade / (price * 100))
-
-        safe_lots = max(0, min(max_from_bp, max_from_cap, max_lots))
-
-        if safe_lots == 0:
-            log("RISK", "LOTS", f"No affordable lots at ${price:.2f}")
-
-        return safe_lots
-
     def get_dynamic_order_size(self, price: float) -> int:
         """
-        Scale order size inversely with price.
+        Week 3 illiquid stock sizing — more conservative than Week 1/2.
 
-        GS  $927 × 1 lot = $92,700  → 1 lot
-        CAT $631 × 1 lot = $63,100  → 1 lot
-        JPM $308 × 2 lots = $61,600 → 2 lots
-        AAPL$259 × 2 lots = $51,800 → 2 lots
-        BA  $240 × 2 lots = $48,000 → 2 lots
-        NVDA$181 × 2 lots = $36,200 → 2 lots
-        NKE  $67 × 3 lots = $20,100 → 3 lots
-        MMM $169 × 3 lots = $50,700 → 3 lots
+        Why smaller lots for illiquid stocks:
+        - Bid/ask book depths are often just 1 lot on each side
+        - Placing 3-lot orders on stocks with 1-lot books causes market impact
+        - Smaller positions = more trades possible within BP limits
+        - $7 BGS gets 1 lot ($700) not 3 lots ($2,100) to avoid being the whole market
+
+        Tiers (based on Week 3 price observations):
+          > $200  →  1 lot   SAM $324, WING $327, WDFC $270
+          > $80   →  2 lots  CROX $110, CAR $100, SHAK $134, TXRH $192
+          > $10   →  2 lots  HELE $73, COLM $90, JACK $48, PZZA $49,
+                              SHOO $44, YETI $43, ENR $38
+          ≤ $10   →  1 lot   BGS $7 — tiny stock, 1 lot avoids being
+                              the entire bid side
         """
-        if price > 500:
-            return 1
-        elif price > 200:
-            return 2
-        else:
-            return 3
+        if price > 200:
+            return 1   # was 2 — SAM/WING/WDFC have thin books at $270-$327
+        if price > 10:
+            return 2   # was 3 — mid-range illiquid stocks
+        return 1       # was 3 — micro-price stocks like BGS
+
+    def get_safe_lot_size(self, price: float, requested_lots: int) -> int:
+        """
+        Cap requested lots by:
+        1. max_position_lots global ceiling
+        2. max_bp_per_trade cost ceiling
+        Returns 0 if neither constraint can be satisfied.
+        """
+        if price <= 0:
+            return 0
+
+        lots = min(requested_lots, self.max_position_lots)
+
+        # Reduce until cost fits within per-trade BP limit
+        while lots > 0:
+            cost = price * lots * 100  # lots × 100 shares
+            if cost <= self.max_bp_per_trade:
+                return lots
+            lots -= 1
+
+        return 0
 
     # ------------------------------------------------------------------ #
-    #  Concurrent position check                                           #
+    #  Trade gate                                                          #
     # ------------------------------------------------------------------ #
-    def get_open_position_count(self) -> int:
+    def can_trade(
+        self, ticker: str, is_buy: bool, price: float
+    ) -> bool:
+        """
+        Returns True only if ALL of the following pass:
+        1. Global halt not active
+        2. Ticker not individually halted
+        3. Buying power floor not breached
+        4. Per-ticker loss limit not breached
+        5. Total loss limit not breached
+        6. Concurrent position limit not breached
+        """
+        if self.all_halted:
+            log("RISK", ticker, "Global halt active — rejecting trade")
+            return False
+
+        if ticker in self.halted_tickers:
+            log("RISK", ticker, "Ticker halted — rejecting trade")
+            return False
+
+        # Check BP floor
+        try:
+            current_bp  = self.trader.get_portfolio_summary().get_total_bp()
+            bp_floor    = self.starting_bp * (1 - self.max_bp_usage)
+            trade_cost  = price * 100  # 1 lot minimum cost estimate
+            if current_bp - trade_cost < bp_floor:
+                log("RISK", "BP",
+                    f"Insufficient BP: current=${current_bp:,.2f} | "
+                    f"floor=${bp_floor:,.2f} | cost=${trade_cost:,.2f}")
+                return False
+        except Exception:
+            pass
+
+        # Check per-ticker P&L
+        try:
+            ticker_pl = self.trader.get_portfolio_item(ticker).get_realized_pl()
+            if ticker_pl <= self.max_loss_per_ticker:
+                log("RISK", ticker,
+                    f"Ticker loss limit hit: ${ticker_pl:,.2f} — halting")
+                self.halted_tickers.add(ticker)
+                return False
+        except Exception:
+            pass
+
+        # Check total P&L
+        try:
+            total_pl = self.trader.get_portfolio_summary().get_total_realized_pl()
+            if total_pl <= self.max_total_loss:
+                log("RISK", "ALL",
+                    f"Total loss limit hit: ${total_pl:,.2f} — halting all")
+                self.halt_all()
+                return False
+        except Exception:
+            pass
+
+        # Check concurrent positions
+        try:
+            open_count = self._count_open_positions()
+            if open_count >= self.max_concurrent_positions:
+                log("RISK", "CONCURRENT",
+                    f"Max concurrent positions reached "
+                    f"({open_count}/{self.max_concurrent_positions})")
+                return False
+        except Exception:
+            pass
+
+        return True
+
+    def can_close(self, ticker: str, price: float) -> bool:
+        """
+        Closing positions is always allowed except on global halt.
+        Individual ticker halts don't block closes — we want to exit.
+        """
+        if self.all_halted:
+            return False
+        return True
+
+    def can_open_new_position(self) -> bool:
+        return (
+            not self.all_halted and
+            self._count_open_positions() < self.max_concurrent_positions
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Internal helpers                                                    #
+    # ------------------------------------------------------------------ #
+    def _count_open_positions(self) -> int:
         count = 0
         for ticker in self.total_tickers:
             try:
-                if get_position(self.trader, ticker) != 0:
+                item  = self.trader.get_portfolio_item(ticker)
+                long  = item.get_long_shares()
+                short = item.get_short_shares()
+                if long > 0 or short > 0:
                     count += 1
             except Exception:
                 pass
         return count
 
-    def can_open_new_position(self) -> bool:
-        count = self.get_open_position_count()
-        if count >= self.max_concurrent_positions:
-            log(
-                "RISK", "CONCURRENT",
-                f"Max concurrent positions reached: "
-                f"{count}/{self.max_concurrent_positions}"
-            )
-            return False
-        return True
-
     # ------------------------------------------------------------------ #
-    #  Buying power checks                                                 #
-    # ------------------------------------------------------------------ #
-    def has_buying_power(self, estimated_cost: float) -> bool:
-        if self.initial_bp is None:
-            return False
-
-        current_bp = get_buying_power(self.trader)
-        bp_floor   = self.initial_bp * (1 - self.max_bp_usage)
-
-        if current_bp - estimated_cost < bp_floor:
-            log(
-                "RISK", "BP",
-                f"Insufficient BP: current=${current_bp:,.2f} | "
-                f"floor=${bp_floor:,.2f} | "
-                f"cost=${estimated_cost:,.2f}"
-            )
-            return False
-        return True
-
-    def get_bp_usage_pct(self) -> float:
-        if self.initial_bp is None or self.initial_bp == 0:
-            return 0.0
-        return (self.initial_bp - get_buying_power(self.trader)) / self.initial_bp
-
-    def get_available_bp(self) -> float:
-        if self.initial_bp is None:
-            return 0.0
-        bp_floor = self.initial_bp * (1 - self.max_bp_usage)
-        return max(0, get_buying_power(self.trader) - bp_floor)
-
-    # ------------------------------------------------------------------ #
-    #  Position size checks                                                #
-    # ------------------------------------------------------------------ #
-    def can_open_long(self, ticker: str) -> bool:
-        position = get_position(self.trader, ticker)
-        if position >= self.max_position_lots * 100:
-            log("RISK", ticker, f"Max long reached: {position} shares")
-            return False
-        return True
-
-    def can_open_short(self, ticker: str) -> bool:
-        position = get_position(self.trader, ticker)
-        if position <= -self.max_position_lots * 100:
-            log("RISK", ticker, f"Max short reached: {position} shares")
-            return False
-        return True
-
-    # ------------------------------------------------------------------ #
-    #  Loss limit checks                                                   #
-    # ------------------------------------------------------------------ #
-    def check_ticker_loss(self, ticker: str) -> bool:
-        if ticker in self.halted_tickers:
-            return False
-        try:
-            pl         = self.trader.get_portfolio_item(ticker).get_realized_pl()
-            unrealized = self.trader.get_unrealized_pl(ticker)
-            total_pl   = pl + unrealized
-
-            if total_pl < self.max_loss_per_ticker:
-                log(
-                    "RISK", ticker,
-                    f"Loss limit: ${total_pl:,.2f} < "
-                    f"${self.max_loss_per_ticker:,.2f} — halting"
-                )
-                self.halted_tickers.add(ticker)
-                return False
-        except Exception as e:
-            log("RISK", ticker, f"Error checking loss: {e}")
-            return False
-        return True
-
-    def check_total_loss(self) -> bool:
-        if self.all_halted:
-            return False
-        try:
-            total_pl = self.trader.get_portfolio_summary().get_total_realized_pl()
-            if total_pl < self.max_total_loss:
-                log(
-                    "RISK", "PORTFOLIO",
-                    f"Total loss breached: ${total_pl:,.2f} — HALTING ALL"
-                )
-                self.all_halted = True
-                return False
-        except Exception as e:
-            log("RISK", "PORTFOLIO", f"Error: {e}")
-            return False
-        return True
-
-    # ------------------------------------------------------------------ #
-    #  Master trade check                                                  #
-    # ------------------------------------------------------------------ #
-    def can_trade(self, ticker: str, is_buy: bool, price: float) -> bool:
-        if price <= 0:
-            return False
-        if self.all_halted:
-            return False
-        if ticker in self.halted_tickers:
-            return False
-        if not self.check_total_loss():
-            return False
-        if not self.check_ticker_loss(ticker):
-            return False
-        if not self.can_open_new_position():
-            return False
-        if not self.has_buying_power(price * 100):
-            return False
-        if is_buy and not self.can_open_long(ticker):
-            return False
-        if not is_buy and not self.can_open_short(ticker):
-            return False
-        return True
-
-    # ------------------------------------------------------------------ #
-    #  Close check — bypasses halt                                         #
-    # ------------------------------------------------------------------ #
-    def can_close(self, ticker: str, price: float) -> bool:
-        if price <= 0:
-            return False
-        if not self.has_buying_power(price * 100):
-            return False
-        return True
-
-    # ------------------------------------------------------------------ #
-    #  Status report                                                       #
-    # ------------------------------------------------------------------ #
-    def print_status(self):
-        bp_usage   = self.get_bp_usage_pct()
-        current_bp = get_buying_power(self.trader)
-        available  = self.get_available_bp()
-        open_pos   = self.get_open_position_count()
-
-        try:
-            total_pl = self.trader.get_portfolio_summary().get_total_realized_pl()
-        except Exception:
-            total_pl = 0.0
-
-        print("\n" + "-"*50, flush=True)
-        print(f"[RISK @ {datetime.now().strftime('%H:%M:%S')}]", flush=True)
-        print(f"  Buying Power:      ${current_bp:,.2f} ({bp_usage*100:.1f}% used)", flush=True)
-        print(f"  Available BP:      ${available:,.2f}", flush=True)
-        print(f"  Total P&L:         ${total_pl:,.2f}", flush=True)
-        print(f"  Open Positions:    {open_pos}/{self.max_concurrent_positions}", flush=True)
-        print(f"  Max Total Loss:    ${self.max_total_loss:,.2f}", flush=True)
-        print(f"  Halted:            {self.halted_tickers if self.halted_tickers else 'None'}", flush=True)
-        print(f"  All Halted:        {self.all_halted}", flush=True)
-        print("-"*50 + "\n", flush=True)
-
-    # ------------------------------------------------------------------ #
-    #  Manual controls                                                     #
+    #  Halt controls                                                       #
     # ------------------------------------------------------------------ #
     def halt_ticker(self, ticker: str):
         self.halted_tickers.add(ticker)
-        log("RISK", ticker, "Manually halted")
-
-    def resume_ticker(self, ticker: str):
-        self.halted_tickers.discard(ticker)
-        log("RISK", ticker, "Manually resumed")
+        log("RISK", ticker, "Ticker halted")
 
     def halt_all(self):
         self.all_halted = True
-        log("RISK", "ALL", "Emergency halt")
+        log("RISK", "ALL", "Emergency halt — all strategies stopped")
 
-    def register_strategy(self, ticker: str, strategy_name: str):
-        self.ticker_strategy_map[ticker] = strategy_name
+    # ------------------------------------------------------------------ #
+    #  Status reporting                                                    #
+    # ------------------------------------------------------------------ #
+    def print_status(self):
+        try:
+            summary    = self.trader.get_portfolio_summary()
+            current_bp = summary.get_total_bp()
+            total_pl   = summary.get_total_realized_pl()
+            bp_used_pct = (
+                (self.starting_bp - current_bp) / self.starting_bp * 100
+                if self.starting_bp > 0 else 0
+            )
+            open_pos = self._count_open_positions()
 
-    def get_strategy_for_ticker(self, ticker: str) -> str:
-        return self.ticker_strategy_map.get(ticker, "UNKNOWN")
+            print("\n" + "-" * 50, flush=True)
+            print(
+                f"[RISK @ "
+                f"{__import__('datetime').datetime.now().strftime('%H:%M:%S')}]",
+                flush=True
+            )
+            print(
+                f"  Buying Power:      ${current_bp:,.2f} "
+                f"({bp_used_pct:.1f}% used)",
+                flush=True
+            )
+            print(
+                f"  Available BP:      "
+                f"${current_bp - self.starting_bp*(1-self.max_bp_usage):,.2f}",
+                flush=True
+            )
+            print(f"  Total P&L:         ${total_pl:,.2f}", flush=True)
+            print(
+                f"  Open Positions:    {open_pos}/{self.max_concurrent_positions}",
+                flush=True
+            )
+            print(
+                f"  Max Total Loss:    ${self.max_total_loss:,.2f}",
+                flush=True
+            )
+            print(
+                f"  Halted:            "
+                f"{', '.join(self.halted_tickers) if self.halted_tickers else 'None'}",
+                flush=True
+            )
+            print(f"  All Halted:        {self.all_halted}", flush=True)
+            print("-" * 50 + "\n", flush=True)
+
+        except Exception as e:
+            log("RISK", "STATUS", f"Error: {e}")
